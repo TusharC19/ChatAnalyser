@@ -1,4 +1,6 @@
+import re
 import streamlit as st
+import pandas as pd
 import preprocessor
 import helper
 import matplotlib.pyplot as plt
@@ -7,6 +9,158 @@ import seaborn as sns
 from ai.analyzer import analyze_chat
 from ai.semantic_search import SemanticSearch
 
+
+def show_action_source(df, row):
+    message_id = int(row["message_id"])
+
+    matching = df.index[
+        df["message_id"] == message_id
+    ].tolist()
+
+    if not matching:
+        st.warning("Original message not found.")
+        return
+
+    current_index = matching[0]
+
+    start = max(0, current_index - 2)
+    end = min(len(df), current_index + 3)
+
+    context_df = df.iloc[start:end]
+
+    st.markdown("**Evidence:**")
+    evidence = row.get("evidence")
+
+    if evidence and not pd.isna(evidence):
+        st.info(f'"{evidence}"')
+    else:
+        st.caption("No evidence available.")
+
+    st.markdown("**Original conversation:**")
+
+    for _, context_row in context_df.iterrows():
+        prefix = "👉 " if int(context_row["message_id"]) == message_id else ""
+
+        st.markdown(
+            f"{prefix}**{context_row['user']}** "
+            f"({context_row['date']})  \n"
+            f"{context_row['message']}"
+        )
+
+    st.caption(f"Message ID: {message_id}")
+
+
+def deduplicate_actions(actions_df):
+    """
+    Merge duplicate actions even when Gemini assigns different types
+    (for example, task vs request).
+
+    The action text and deadline are used as the identity of an action.
+    The highest-confidence occurrence is retained, so its source/evidence
+    remains available.
+    """
+    if actions_df is None or actions_df.empty:
+        return actions_df
+
+    result = actions_df.copy()
+
+    def normalize_action(value):
+        if value is None or pd.isna(value):
+            return ""
+
+        text = str(value).lower().strip()
+
+        # Remove common punctuation and normalize whitespace.
+        text = re.sub(r"[^a-z0-9\s]", " ", text)
+        text = re.sub(r"\\s+", " ", text).strip()
+
+        # Small normalization for common wording differences.
+        replacements = {
+            "provided": "",
+            "the": "",
+            "a": "",
+            "an": "",
+        }
+
+        words = [
+            word for word in text.split()
+            if word not in replacements
+        ]
+
+        return " ".join(words)
+
+    def normalize_deadline(value):
+        if value is None or pd.isna(value):
+            return ""
+        return " ".join(str(value).lower().strip().split())
+
+    # IMPORTANT:
+    # Type is deliberately NOT part of the duplicate key.
+    #
+    # This means:
+    #   task  -> "fill out the assignment form"
+    #   request -> "fill out the assignment form"
+    #
+    # are recognized as the same practical action.
+    result["_action_key"] = result.apply(
+        lambda row: (
+            normalize_action(
+                row.get("task")
+            ) or normalize_action(
+                row.get("message")
+            ),
+            normalize_deadline(
+                row.get("deadline")
+            ),
+        ),
+        axis=1,
+    )
+
+    result["_confidence_num"] = pd.to_numeric(
+        result["confidence"],
+        errors="coerce"
+    ).fillna(0)
+
+    # Prefer higher-confidence extraction.
+    # If confidence is equal, prefer deadline > task > request > decision.
+    type_priority = {
+        "deadline": 4,
+        "task": 3,
+        "request": 2,
+        "decision": 1,
+    }
+
+    result["_type_priority"] = (
+        result["type"]
+        .astype(str)
+        .str.lower()
+        .map(type_priority)
+        .fillna(0)
+    )
+
+    result = (
+        result
+        .sort_values(
+            ["_action_key", "_confidence_num", "_type_priority"],
+            ascending=[True, False, False],
+        )
+        .drop_duplicates(
+            subset="_action_key",
+            keep="first",
+        )
+        .drop(
+            columns=[
+                "_action_key",
+                "_confidence_num",
+                "_type_priority",
+            ]
+        )
+    )
+
+    if "message_id" in result.columns:
+        result = result.sort_values("message_id")
+
+    return result.reset_index(drop=True)
 
 
 
@@ -571,6 +725,10 @@ if uploaded_file is not None:
                 st.session_state.ai_results
             )
 
+            actionable_results = deduplicate_actions(
+                ai_results
+            )
+
 
             # ==========================================
             # AI SUMMARY
@@ -635,8 +793,8 @@ if uploaded_file is not None:
                 "Actionable Messages"
             )
 
-            actionable = ai_results[
-                ai_results["type"].isin(
+            actionable = actionable_results[
+                actionable_results["type"].isin(
                     [
                         "task",
                         "request",
@@ -672,6 +830,278 @@ if uploaded_file is not None:
                     "No actionable information was found."
                 )
 
+            # ==================================================
+            # ACTION DASHBOARD
+            # ==================================================
+
+            st.subheader("🎯 Action Dashboard")
+
+            if len(actionable_results) < len(ai_results):
+                st.caption(
+                    f"Showing {len(actionable_results)} unique actions "
+                    f"from {len(ai_results)} AI results. "
+                    "Similar actions across different AI types are merged."
+                )
+
+            st.write(
+                "Important tasks, requests, deadlines, "
+                "and decisions identified from your conversation."
+            )
+
+
+            # ==============================================
+            # FILTERS
+            # ==============================================
+
+            filter_col1, filter_col2 = st.columns(2)
+
+            with filter_col1:
+
+                action_type = st.selectbox(
+                    "Filter by type",
+                    [
+                        "All",
+                        "Tasks",
+                        "Requests",
+                        "Deadlines",
+                        "Decisions"
+                    ],
+                    key="action_type_filter"
+                )
+
+            with filter_col2:
+
+                priority_filter = st.selectbox(
+                    "Filter by priority",
+                    [
+                        "All",
+                        "High",
+                        "Medium",
+                        "Low"
+                    ],
+                    key="priority_filter"
+                )
+
+
+            # ==============================================
+            # APPLY FILTERS
+            # ==============================================
+
+            dashboard_df = actionable_results.copy()
+
+            type_mapping = {
+                "Tasks": "task",
+                "Requests": "request",
+                "Deadlines": "deadline",
+                "Decisions": "decision"
+            }
+
+            if action_type != "All":
+
+                dashboard_df = dashboard_df[
+                    dashboard_df["type"]
+                    == type_mapping[action_type]
+                ]
+
+            if priority_filter != "All":
+
+                dashboard_df = dashboard_df[
+                    dashboard_df["priority"].fillna("").str.lower()
+                    == priority_filter.lower()
+                ]
+
+
+            # ==============================================
+            # HIGH PRIORITY
+            # ==============================================
+
+            high_priority = dashboard_df[
+                dashboard_df["priority"].fillna("").str.lower()
+                == "high"
+            ].copy()
+
+            if not high_priority.empty:
+
+                st.markdown("### 🔴 High Priority")
+
+                for _, row in high_priority.iterrows():
+
+                    task_text = row["task"]
+
+                    if (
+                        task_text is None
+                        or pd.isna(task_text)
+                    ):
+                        task_text = row["message"]
+
+                    deadline = row["deadline"]
+
+                    if (
+                        deadline is None
+                        or pd.isna(deadline)
+                    ):
+                        deadline = "Not specified"
+
+                    st.warning(
+                        f"**{task_text}**\n\n"
+                        f"Type: {row['type']}  |  "
+                        f"Deadline: {deadline}  |  "
+                        f"Confidence: {row['confidence']}"
+                    )
+
+                    with st.expander(
+                        f"🔎 View source — Message {int(row['message_id'])}"
+                    ):
+                        show_action_source(df, row)
+
+            # High-priority actions have already been displayed above.
+            # Exclude them from the category sections so one action
+            # appears only once in the dashboard.
+            high_priority_ids = set(
+                high_priority["message_id"].tolist()
+            )
+
+            remaining_df = dashboard_df[
+                ~dashboard_df["message_id"].isin(high_priority_ids)
+            ].copy()
+
+
+            # ==============================================
+            # DEADLINES
+            # ==============================================
+
+            deadline_df = remaining_df[
+                remaining_df["type"] == "deadline"
+            ]
+
+            if not deadline_df.empty:
+
+                st.markdown("### 📅 Deadlines")
+
+                for _, row in deadline_df.iterrows():
+
+                    task_text = row["task"]
+
+                    if (
+                        task_text is None
+                        or pd.isna(task_text)
+                    ):
+                        task_text = "Deadline mentioned"
+
+                    deadline = row["deadline"]
+
+                    if (
+                        deadline is None
+                        or pd.isna(deadline)
+                    ):
+                        deadline = "Date not specified"
+
+                    st.write(
+                        f"📌 **{task_text}** → "
+                        f"**{deadline}**"
+                    )
+
+                    with st.expander(
+                        f"🔎 View source — Message {int(row['message_id'])}"
+                    ):
+                        show_action_source(df, row)
+
+
+            # ==============================================
+            # TASKS
+            # ==============================================
+
+            task_df = remaining_df[
+                remaining_df["type"] == "task"
+            ]
+
+            if not task_df.empty:
+
+                st.markdown("### ✅ Tasks")
+
+                for _, row in task_df.iterrows():
+
+                    task_text = row["task"]
+
+                    if (
+                        task_text is None
+                        or pd.isna(task_text)
+                    ):
+                        task_text = row["message"]
+
+                    st.write(
+                        f"• **{task_text}**"
+                    )
+
+                    with st.expander(
+                        f"🔎 View source — Message {int(row['message_id'])}"
+                    ):
+                        show_action_source(df, row)
+
+
+            # ==============================================
+            # REQUESTS
+            # ==============================================
+
+            request_df = remaining_df[
+                remaining_df["type"] == "request"
+            ]
+
+            if not request_df.empty:
+
+                st.markdown("### 🙋 Requests")
+
+                for _, row in request_df.iterrows():
+
+                    task_text = row["task"]
+
+                    if (
+                        task_text is None
+                        or pd.isna(task_text)
+                    ):
+                        task_text = row["message"]
+
+                    st.write(
+                        f"• **{task_text}**"
+                    )
+
+
+            # ==============================================
+            # DECISIONS
+            # ==============================================
+
+            decision_df = remaining_df[
+                remaining_df["type"] == "decision"
+            ]
+
+            if not decision_df.empty:
+
+                st.markdown("### 🤝 Decisions")
+
+                for _, row in decision_df.iterrows():
+
+                    task_text = row["task"]
+
+                    if (
+                        task_text is None
+                        or pd.isna(task_text)
+                    ):
+                        task_text = row["message"]
+
+                    st.write(
+                        f"• **{task_text}**"
+                    )
+
+
+            # ==============================================
+            # NO RESULTS
+            # ==============================================
+
+            if dashboard_df.empty:
+
+                st.info(
+                    "No items match the selected filters."
+                )
 
         # ==================================================
         # ASK YOUR CONVERSATION
@@ -789,7 +1219,6 @@ if uploaded_file is not None:
 
                     st.subheader("🔍 Relevant Messages")
 
-                    # YOUR EXISTING:
                     for result in search_results:
 
                         st.markdown(
